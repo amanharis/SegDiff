@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 
 import git
-from mpi4py import MPI
 
 from improved_diffusion import dist_util, logger
 from datasets.monu import load_data, create_dataset
@@ -42,12 +41,12 @@ def main():
     # args.start_print_iter = 4
     # args.save_interval = 4
 
-    exp_name = f"monu_{args.rrdb_blocks}_{args.lr}_{args.batch_size}_{args.diffusion_steps}_{str(args.dropout)}_{MPI.COMM_WORLD.Get_rank()}"
+    exp_name = f"monu_{args.rrdb_blocks}_{args.lr}_{args.batch_size}_{args.diffusion_steps}_{str(args.dropout)}_0"
     logs_root = Path(__file__).absolute().parent.parent / "logs"
     log_path = logs_root / f"{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')}_{exp_name}"
     os.environ["OPENAI_LOGDIR"] = str(log_path)
-    set_random_seed(MPI.COMM_WORLD.Get_rank(), deterministic=True)
-    set_random_seed_for_iterations(MPI.COMM_WORLD.Get_rank())
+    set_random_seed(0, deterministic=True)  # Single GPU - use 0 as rank
+    set_random_seed_for_iterations(0)  # Single GPU - use 0 as rank
     dist_util.setup_dist()
     logger.configure(dir=str(log_path))
 
@@ -87,7 +86,7 @@ def main():
         image_size=args.image_size
     )
 
-    logger.log(f"gpu {MPI.COMM_WORLD.Get_rank()} / {MPI.COMM_WORLD.Get_size()} val length {len(val_dataset)}")
+    logger.log(f"gpu 0 / 1 val length {len(val_dataset)}")
 
     logger.log("training...")
     TrainLoop(

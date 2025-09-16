@@ -6,9 +6,6 @@ from pathlib import Path
 import blobfile as bf
 import numpy as np
 import torch as th
-import torch.distributed as dist
-from mpi4py import MPI
-from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from tqdm import tqdm
 
@@ -80,7 +77,7 @@ class TrainLoop:
 
         self.step = 1
         self.resume_step = 0
-        self.global_batch = self.batch_size * dist.get_world_size()
+        self.global_batch = self.batch_size  # Single GPU - no world_size multiplication
 
         self.model_params = list(self.model.parameters())
         self.master_params = self.model_params
@@ -108,22 +105,10 @@ class TrainLoop:
             ]
 
         if th.cuda.is_available():
-            self.use_ddp = True
-            self.ddp_model = DDP(
-                self.model,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
+            self.use_ddp = False  # Single GPU - no DDP needed
+            self.ddp_model = self.model  # Use model directly
             self.ema_model = copy.deepcopy(self.model).to(th.device("cpu"))
         else:
-            if dist.get_world_size() > 1:
-                logger.warn(
-                    "Distributed training requires CUDA. "
-                    "Gradients will not be synchronized properly!"
-                )
             self.use_ddp = False
             self.ddp_model = self.model
 
@@ -192,31 +177,28 @@ class TrainLoop:
         self.model.convert_to_fp16()
 
     def run_loop(self, max_iter=250000, start_print_iter=100000, vis_batch_size=8, n_rounds=3):
-        if dist.get_rank() == 0:
-            pbar = tqdm()
+        pbar = tqdm()
         while (
             self.step < max_iter
         ):
             self.ddp_model.train()
             batch, cond, _ = next(self.data)
             self.run_step(batch, cond)
-            if dist.get_rank() == 0:
-                pbar.update(1)
+            pbar.update(1)
             if self.step % self.log_interval == 0 and self.step != 0:
                 logger.log(f"interval")
                 logger.dumpkvs()
                 logger.log(f"class {self.args.class_name} lr {self.lr}, expansion {self.args.expansion}, "
-                           f"rrdb blocks {self.args.rrdb_blocks} gpus {MPI.COMM_WORLD.Get_size()}")
+                           f"rrdb blocks {self.args.rrdb_blocks} gpus {1} (single GPU)")
 
             if self.step % self.save_interval == 0:
                 logger.log(f"save model for checkpoint")
                 self.save_state_dict()
-                dist.barrier()
+                # dist.barrier() # Single GPU - no barrier
 
             if self.step % self.save_interval == 0 and self.step >= start_print_iter or self.step == 60000:
                 if self.run_without_test:
-                    if dist.get_rank() == 0:
-                        self.save_checkpoint(self.ema_rate[0], self.ema_params[0], name=f"model")
+                    self.save_checkpoint(self.ema_rate[0], self.ema_params[0], name=f"model")
                 else:
                     self.ddp_model.eval()
 
@@ -231,22 +213,21 @@ class TrainLoop:
                                                         clip_denoised=self.clip_denoised, step=self.step, n_rounds=len(self.val_dataset))
                     self.ema_model = self.ema_model.to(th.device("cpu")) # release gpu memory
 
-                    if dist.get_rank() == 0:
-                        if self.ema_val_best_iou < ema_val_miou:
-                            logger.log(f"best iou ema val: {ema_val_miou} step {self.step}")
-                            self.ema_val_best_iou = ema_val_miou
+                    if self.ema_val_best_iou < ema_val_miou:
+                        logger.log(f"best iou ema val: {ema_val_miou} step {self.step}")
+                        self.ema_val_best_iou = ema_val_miou
 
-                            ema_filename = self.save_checkpoint(self.ema_rate[0], self.ema_params[0], name=f"val_{ema_val_miou:.7f}")
+                        ema_filename = self.save_checkpoint(self.ema_rate[0], self.ema_params[0], name=f"val_{ema_val_miou:.7f}")
 
-                            if self.val_current_model_ema_name != "":
-                                ckpt_path = bf.join(get_blob_logdir(), self.val_current_model_ema_name)
-                                if os.path.exists(ckpt_path):
-                                    os.remove(ckpt_path)
+                        if self.val_current_model_ema_name != "":
+                            ckpt_path = bf.join(get_blob_logdir(), self.val_current_model_ema_name)
+                            if os.path.exists(ckpt_path):
+                                os.remove(ckpt_path)
 
-                            self.val_current_model_ema_name = ema_filename
+                        self.val_current_model_ema_name = ema_filename
 
-                set_random_seed_for_iterations(MPI.COMM_WORLD.Get_rank() + self.step)
-                dist.barrier()
+                set_random_seed_for_iterations(0 + self.step)  # Single GPU - use 0 as rank
+                # dist.barrier() # Single GPU - no barrier
             self.step += 1
 
     def run_step(self, batch, cond):
@@ -342,7 +323,7 @@ class TrainLoop:
 
     def save_checkpoint(self, rate, params, name):
         state_dict = self._master_params_to_state_dict(params)
-        if dist.get_rank() == 0:
+        if th.cuda.is_available():
             logger.log(f"saving model {rate}...")
             if not rate:
                 filename = f"model_{name}_{(self.step+self.resume_step):06d}.pt"
@@ -354,54 +335,27 @@ class TrainLoop:
 
     def save_state_dict(self):
 
-        if dist.get_rank() == 0:
-            with bf.BlobFile(bf.join(get_blob_logdir(), f"opt.pt"), "wb",) as f:
-                th.save(self.opt.state_dict(), f)
+        with bf.BlobFile(bf.join(get_blob_logdir(), f"opt.pt"), "wb",) as f:
+            th.save(self.opt.state_dict(), f)
 
-            with bf.BlobFile(bf.join(get_blob_logdir(), f"model{self.step}.pt"), "wb") as f:
-                th.save(self._master_params_to_state_dict(self.master_params), f)
+        with bf.BlobFile(bf.join(get_blob_logdir(), f"model{self.step}.pt"), "wb") as f:
+            th.save(self._master_params_to_state_dict(self.master_params), f)
 
-            if self.current_model_checkpoint_name != "":
-                ckpt_path = bf.join(get_blob_logdir(), self.current_model_checkpoint_name)
-                if os.path.exists(ckpt_path):
-                    os.remove(ckpt_path)
+        if self.current_model_checkpoint_name != "":
+            ckpt_path = bf.join(get_blob_logdir(), self.current_model_checkpoint_name)
+            if os.path.exists(ckpt_path):
+                os.remove(ckpt_path)
 
-            self.current_model_checkpoint_name = bf.join(get_blob_logdir(), f"model{self.step}.pt")
+        self.current_model_checkpoint_name = bf.join(get_blob_logdir(), f"model{self.step}.pt")
 
-            with bf.BlobFile(bf.join(get_blob_logdir(), f"ema.pt"), "wb") as f:
-                th.save(self._master_params_to_state_dict(self.ema_params[0]), f)
-        #
-        # checkpoint = {
-        #     'step': self.step,
-        #     'state_dict': self._master_params_to_state_dict(self.master_params),
-        #     'ema_state_dict': self._master_params_to_state_dict(self.ema_params[0]),
-        #     'optimizer': self.opt.state_dict()
-        # }
-        #
-        # current_model_checkpoint_name = bf.join(get_blob_logdir(), file_name)
-        # th.save(checkpoint, current_model_checkpoint_name)
-        #
-        # if self.current_model_checkpoint_name != "":
-        #     ckpt_path = bf.join(get_blob_logdir(), self.current_model_checkpoint_name)
-        #     if os.path.exists(ckpt_path):
-        #         os.remove(ckpt_path)
-        #
-        # self.current_model_checkpoint_name = current_model_checkpoint_name
+        with bf.BlobFile(bf.join(get_blob_logdir(), f"ema.pt"), "wb") as f:
+            th.save(self._master_params_to_state_dict(self.ema_params[0]), f)
 
     def save(self, name):
 
         filename = self.save_checkpoint(0, self.master_params, name)
         for rate, params in zip(self.ema_rate, self.ema_params):
             filename_ema = self.save_checkpoint(rate, params, name)
-
-        # if dist.get_rank() == 0:
-        #     with bf.BlobFile(
-        #         bf.join(get_blob_logdir(), f"opt{(self.step+self.resume_step):06d}.pt"),
-        #         "wb",
-        #     ) as f:
-        #         th.save(self.opt.state_dict(), f)
-
-        # dist.barrier()
 
         return filename, filename_ema
 

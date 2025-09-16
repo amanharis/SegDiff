@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tifffile
 import torch
-from mpi4py import MPI
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -117,17 +116,10 @@ class MonuDataset(torch.utils.data.Dataset):
         self.mean = torch.from_numpy(np.array([142.07, 98.48, 132.96]))
         self.std = torch.from_numpy(np.array([65.78, 57.05, 57.78]))
 
-        shard = MPI.COMM_WORLD.Get_rank()
-        num_shards = MPI.COMM_WORLD.Get_size()
-
         for file_path in tqdm(self.paths):
             mask_path = file_path.split('.')[0] + '.png'
             self.imgs.append(self.loader(os.path.join(self.imgs_root, file_path), is_mask=False))
             self.masks.append(self.loader(os.path.join(self.masks_root, mask_path), is_mask=True))
-
-        self.imgs = self.imgs[shard::num_shards]
-        self.masks = self.masks[shard::num_shards]
-        self.paths = self.paths[shard::num_shards]
 
         print('num of data:{}'.format(len(self.paths)))
 
